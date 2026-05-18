@@ -8,7 +8,7 @@ import (
 )
 
 type Hash [32]byte
-type Address [32]byte
+type Address = state.Address
 
 type Config struct {
 	MaxCallDepth int
@@ -51,6 +51,9 @@ func (v *VM) WithTracer(t Tracer) *VM {
 }
 
 func (v *VM) Execute(ctx CallContext, code []byte) (Receipt, error) {
+	if _, err := v.verifier.VerifyPayload(ctx.Input); err != nil {
+		return Receipt{}, err
+	}
 	if err := v.verifier.VerifyBytecode(code); err != nil {
 		return Receipt{}, err
 	}
