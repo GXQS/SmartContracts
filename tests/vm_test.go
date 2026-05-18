@@ -9,7 +9,7 @@ import (
 
 func TestVMExecutesDeterministicBytecode(t *testing.T) {
 	engine := vm.New(vm.Config{}, state.NewMemoryDB())
-	ctx := vm.NewCallContext(vm.Address{}, vm.Address{}, nil, 100000)
+	ctx := vm.NewCallContext(vm.Address{}, vm.Address{}, validPayloadFixture(), 100000)
 	code := []byte{byte(vm.PUSH1), 0x02, byte(vm.PUSH1), 0x03, byte(vm.ADD), byte(vm.STOP)}
 	receipt, err := engine.Execute(ctx, code)
 	if err != nil {

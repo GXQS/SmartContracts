@@ -8,28 +8,10 @@ import (
 	"github.com/GXQS/SmartContracts/pkg/vm"
 )
 
-func putU32BE(dst []byte, offset int, value uint32) {
-	dst[offset] = byte(value >> 24)
-	dst[offset+1] = byte(value >> 16)
-	dst[offset+2] = byte(value >> 8)
-	dst[offset+3] = byte(value)
-}
-
-func putU64BE(dst []byte, offset int, value uint64) {
-	dst[offset] = byte(value >> 56)
-	dst[offset+1] = byte(value >> 48)
-	dst[offset+2] = byte(value >> 40)
-	dst[offset+3] = byte(value >> 32)
-	dst[offset+4] = byte(value >> 24)
-	dst[offset+5] = byte(value >> 16)
-	dst[offset+6] = byte(value >> 8)
-	dst[offset+7] = byte(value)
-}
-
-func validPayload() []byte {
-	payload := make([]byte, 108+3309+1952+64)
-	putU32BE(payload, 0, 1)
-	putU64BE(payload, 4, 7)
+func buildPayloadWithData() []byte {
+	payload := vm.BuildBoundaryPayload(64)
+	vm.WriteU32BE(payload, vm.HeaderVersionOffset, 1)
+	vm.WriteU64BE(payload, vm.HeaderNonceOffset, 7)
 
 	var sender state.Address
 	var recipient state.Address
@@ -37,20 +19,20 @@ func validPayload() []byte {
 		sender[i] = byte(i + 1)
 		recipient[i] = byte(i + 33)
 	}
-	copy(payload[12:44], sender[:])
-	copy(payload[44:76], recipient[:])
+	copy(payload[vm.HeaderSenderOffset:vm.HeaderRecipientOffset], sender[:])
+	copy(payload[vm.HeaderRecipientOffset:vm.HeaderGasLimitOffset], recipient[:])
 
-	putU64BE(payload, 76, 500000)
-	putU64BE(payload, 84, 2)
-	putU32BE(payload, 92, 108)
-	putU32BE(payload, 96, 108+3309)
-	putU32BE(payload, 100, 108+3309+1952)
-	putU32BE(payload, 104, 64)
+	vm.WriteU64BE(payload, vm.HeaderGasLimitOffset, 500000)
+	vm.WriteU64BE(payload, vm.HeaderGasPriceOffset, 2)
+	vm.WriteU32BE(payload, vm.HeaderSigOffsetOffset, vm.PayloadHeaderSize)
+	vm.WriteU32BE(payload, vm.HeaderPubOffsetOffset, vm.PayloadHeaderSize+vm.MLDSA65SignatureSize)
+	vm.WriteU32BE(payload, vm.HeaderDataOffset, vm.PayloadHeaderSize+vm.MLDSA65SignatureSize+vm.MLDSA65PublicKeySize)
+	vm.WriteU32BE(payload, vm.HeaderDataLenOffset, 64)
 	return payload
 }
 
 func TestZeroCopyPayloadVerifierValidPayload(t *testing.T) {
-	payload := validPayload()
+	payload := buildPayloadWithData()
 	verifier := vm.NewZeroCopyPayloadVerifier(payload)
 	header, err := verifier.VerifyPayloadBoundaries()
 	if err != nil {
@@ -60,22 +42,22 @@ func TestZeroCopyPayloadVerifierValidPayload(t *testing.T) {
 		t.Fatal("unexpected parsed header values")
 	}
 	for i := 0; i < 32; i++ {
-		if header.Sender[i] != payload[12+i] || header.Recipient[i] != payload[44+i] {
+		if header.Sender[i] != payload[vm.HeaderSenderOffset+i] || header.Recipient[i] != payload[vm.HeaderRecipientOffset+i] {
 			t.Fatal("address windows parsed incorrectly")
 		}
 	}
 }
 
 func TestZeroCopyPayloadVerifierRejectsMalformedHeader(t *testing.T) {
-	_, err := vm.NewZeroCopyPayloadVerifier(make([]byte, 107)).VerifyPayloadBoundaries()
+	_, err := vm.NewZeroCopyPayloadVerifier(make([]byte, vm.PayloadHeaderSize-1)).VerifyPayloadBoundaries()
 	if !errors.Is(err, vm.ErrMalformedPayloadHeader) {
 		t.Fatalf("expected malformed header error, got %v", err)
 	}
 }
 
 func TestZeroCopyPayloadVerifierRejectsSignatureWindowOverflow(t *testing.T) {
-	payload := validPayload()
-	putU32BE(payload, 92, uint32(len(payload)-3308))
+	payload := buildPayloadWithData()
+	vm.WriteU32BE(payload, vm.HeaderSigOffsetOffset, uint32(len(payload)-vm.MLDSA65SignatureSize+1))
 	_, err := vm.NewZeroCopyPayloadVerifier(payload).VerifyPayloadBoundaries()
 	if !errors.Is(err, vm.ErrSignatureSizeMismatch) {
 		t.Fatalf("expected signature mismatch error, got %v", err)
@@ -83,8 +65,8 @@ func TestZeroCopyPayloadVerifierRejectsSignatureWindowOverflow(t *testing.T) {
 }
 
 func TestZeroCopyPayloadVerifierRejectsPubKeyWindowOverflow(t *testing.T) {
-	payload := validPayload()
-	putU32BE(payload, 96, uint32(len(payload)-1951))
+	payload := buildPayloadWithData()
+	vm.WriteU32BE(payload, vm.HeaderPubOffsetOffset, uint32(len(payload)-vm.MLDSA65PublicKeySize+1))
 	_, err := vm.NewZeroCopyPayloadVerifier(payload).VerifyPayloadBoundaries()
 	if !errors.Is(err, vm.ErrPublicKeySizeMismatch) {
 		t.Fatalf("expected public key mismatch error, got %v", err)
@@ -92,9 +74,9 @@ func TestZeroCopyPayloadVerifierRejectsPubKeyWindowOverflow(t *testing.T) {
 }
 
 func TestZeroCopyPayloadVerifierRejectsDataWindowOverflow(t *testing.T) {
-	payload := validPayload()
-	putU32BE(payload, 100, uint32(len(payload)-10))
-	putU32BE(payload, 104, 11)
+	payload := buildPayloadWithData()
+	vm.WriteU32BE(payload, vm.HeaderDataOffset, uint32(len(payload)-10))
+	vm.WriteU32BE(payload, vm.HeaderDataLenOffset, 11)
 	_, err := vm.NewZeroCopyPayloadVerifier(payload).VerifyPayloadBoundaries()
 	if !errors.Is(err, vm.ErrMalformedPayloadHeader) {
 		t.Fatalf("expected malformed payload error, got %v", err)
@@ -107,5 +89,10 @@ func TestVMExecuteRunsPayloadVerifierBeforeInterpreter(t *testing.T) {
 	_, err := engine.Execute(ctx, []byte{byte(vm.STOP)})
 	if !errors.Is(err, vm.ErrMalformedPayloadHeader) {
 		t.Fatalf("expected payload verifier error, got %v", err)
+	}
+
+	validCtx := vm.NewCallContext(vm.Address{}, vm.Address{}, validPayloadFixture(), 100000)
+	if _, err := engine.Execute(validCtx, []byte{byte(vm.STOP)}); err != nil {
+		t.Fatalf("expected valid ctx.Input to pass payload verifier, got %v", err)
 	}
 }

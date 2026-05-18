@@ -22,7 +22,7 @@ func main() {
 	}
 
 	engine := vm.New(vm.Config{MaxCallDepth: 16, MaxMemory: 1 << 20}, state.NewMemoryDB())
-	r := vm.NewCallContext(vm.Address{}, vm.Address{}, nil, 1_000_000)
+	r := vm.NewCallContext(vm.Address{}, vm.Address{}, vm.BuildBoundaryPayload(0), 1_000_000)
 	receipt, err := engine.Execute(r, code)
 	if err != nil {
 		fmt.Println("execution error:", err)

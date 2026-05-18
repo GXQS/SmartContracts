@@ -12,6 +12,22 @@ var (
 	ErrPublicKeySizeMismatch  = errors.New("boundary violation: ML-DSA-65 public key must be exactly 1952 bytes")
 )
 
+const (
+	PayloadHeaderSize     = 108
+	MLDSA65SignatureSize  = 3309
+	MLDSA65PublicKeySize  = 1952
+	HeaderVersionOffset   = 0
+	HeaderNonceOffset     = 4
+	HeaderSenderOffset    = 12
+	HeaderRecipientOffset = 44
+	HeaderGasLimitOffset  = 76
+	HeaderGasPriceOffset  = 84
+	HeaderSigOffsetOffset = 92
+	HeaderPubOffsetOffset = 96
+	HeaderDataOffset      = 100
+	HeaderDataLenOffset   = 104
+)
+
 // TransactionHeader mirrors the exact Protobuf schema defined in GXQS/Manifest.
 type TransactionHeader struct {
 	Version      uint32
@@ -53,42 +69,86 @@ func readU64BE(raw []byte, offset int) uint64 {
 		uint64(raw[offset+7])
 }
 
+func WriteU32BE(raw []byte, offset int, value uint32) {
+	raw[offset] = byte(value >> 24)
+	raw[offset+1] = byte(value >> 16)
+	raw[offset+2] = byte(value >> 8)
+	raw[offset+3] = byte(value)
+}
+
+func WriteU64BE(raw []byte, offset int, value uint64) {
+	raw[offset] = byte(value >> 56)
+	raw[offset+1] = byte(value >> 48)
+	raw[offset+2] = byte(value >> 40)
+	raw[offset+3] = byte(value >> 32)
+	raw[offset+4] = byte(value >> 24)
+	raw[offset+5] = byte(value >> 16)
+	raw[offset+6] = byte(value >> 8)
+	raw[offset+7] = byte(value)
+}
+
+func BuildBoundaryPayload(dataLen uint32) []byte {
+	sigOffset := PayloadHeaderSize
+	pubOffset := sigOffset + MLDSA65SignatureSize
+	dataOffset := pubOffset + MLDSA65PublicKeySize
+
+	payload := make([]byte, dataOffset+int(dataLen))
+	WriteU32BE(payload, HeaderVersionOffset, 1)
+	WriteU64BE(payload, HeaderNonceOffset, 1)
+	WriteU64BE(payload, HeaderGasLimitOffset, 1_000_000)
+	WriteU64BE(payload, HeaderGasPriceOffset, 1)
+	WriteU32BE(payload, HeaderSigOffsetOffset, uint32(sigOffset))
+	WriteU32BE(payload, HeaderPubOffsetOffset, uint32(pubOffset))
+	WriteU32BE(payload, HeaderDataOffset, uint32(dataOffset))
+	WriteU32BE(payload, HeaderDataLenOffset, dataLen)
+	return payload
+}
+
 // VerifyPayloadBoundaries inspects the memory map without expensive heap allocations.
 func (v *ZeroCopyPayloadVerifier) VerifyPayloadBoundaries() (*TransactionHeader, error) {
-	// Minimum header size safety check (4 + 8 + 32 + 32 + 8 + 8 + 4 + 4 + 4 + 4 = 108 bytes).
-	if len(v.rawPayload) < 108 {
+	// Minimum header size safety check: Version(4) + Nonce(8) + Sender(32) + Recipient(32) + GasLimit(8) + GasPrice(8) + SigOffset(4) + PubKeyOffset(4) + DataOffset(4) + DataLen(4) = PayloadHeaderSize.
+	if len(v.rawPayload) < PayloadHeaderSize {
 		return nil, ErrMalformedPayloadHeader
 	}
 
 	// Parse header layout boundaries directly from big-endian data stream windows.
 	header := &TransactionHeader{
-		Version:      readU32BE(v.rawPayload, 0),
-		Nonce:        readU64BE(v.rawPayload, 4),
-		GasLimit:     readU64BE(v.rawPayload, 76),
-		GasPrice:     readU64BE(v.rawPayload, 84),
-		SigOffset:    readU32BE(v.rawPayload, 92),
-		PubKeyOffset: readU32BE(v.rawPayload, 96),
-		DataOffset:   readU32BE(v.rawPayload, 100),
-		DataLen:      readU32BE(v.rawPayload, 104),
+		Version:      readU32BE(v.rawPayload, HeaderVersionOffset),
+		Nonce:        readU64BE(v.rawPayload, HeaderNonceOffset),
+		GasLimit:     readU64BE(v.rawPayload, HeaderGasLimitOffset),
+		GasPrice:     readU64BE(v.rawPayload, HeaderGasPriceOffset),
+		SigOffset:    readU32BE(v.rawPayload, HeaderSigOffsetOffset),
+		PubKeyOffset: readU32BE(v.rawPayload, HeaderPubOffsetOffset),
+		DataOffset:   readU32BE(v.rawPayload, HeaderDataOffset),
+		DataLen:      readU32BE(v.rawPayload, HeaderDataLenOffset),
 	}
 
 	// Extract explicit Address segments using deterministic memory windows.
-	copy(header.Sender[:], v.rawPayload[12:44])
-	copy(header.Recipient[:], v.rawPayload[44:76])
+	copy(header.Sender[:], v.rawPayload[HeaderSenderOffset:HeaderRecipientOffset])
+	copy(header.Recipient[:], v.rawPayload[HeaderRecipientOffset:HeaderGasLimitOffset])
 
 	payloadLen := uint32(len(v.rawPayload))
-	if header.SigOffset < 108 || header.PubKeyOffset < 108 || header.DataOffset < 108 {
+	if header.SigOffset < PayloadHeaderSize || header.PubKeyOffset < PayloadHeaderSize || header.DataOffset < PayloadHeaderSize {
 		return nil, ErrMalformedPayloadHeader
 	}
 
 	// Enforce hard structural constraints derived from FIPS 204/203 standards.
-	if uint64(header.SigOffset)+3309 > uint64(payloadLen) {
+	if header.SigOffset > payloadLen {
 		return nil, ErrSignatureSizeMismatch
 	}
-	if uint64(header.PubKeyOffset)+1952 > uint64(payloadLen) {
+	if payloadLen-header.SigOffset < MLDSA65SignatureSize {
+		return nil, ErrSignatureSizeMismatch
+	}
+	if header.PubKeyOffset > payloadLen {
 		return nil, ErrPublicKeySizeMismatch
 	}
-	if uint64(header.DataOffset)+uint64(header.DataLen) > uint64(payloadLen) {
+	if payloadLen-header.PubKeyOffset < MLDSA65PublicKeySize {
+		return nil, ErrPublicKeySizeMismatch
+	}
+	if header.DataOffset > payloadLen {
+		return nil, ErrMalformedPayloadHeader
+	}
+	if payloadLen-header.DataOffset < header.DataLen {
 		return nil, ErrMalformedPayloadHeader
 	}
 
@@ -121,7 +181,7 @@ func (DefaultVerifier) VerifyABI(raw []byte) error {
 
 func (DefaultVerifier) VerifyPayload(raw []byte) (*TransactionHeader, error) {
 	if len(raw) == 0 {
-		return nil, nil
+		return nil, ErrMalformedPayloadHeader
 	}
 	return NewZeroCopyPayloadVerifier(raw).VerifyPayloadBoundaries()
 }
